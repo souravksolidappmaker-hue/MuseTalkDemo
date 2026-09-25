@@ -18,18 +18,22 @@ Run from the repository root:
 
 import base64
 import copy
+import functools
 import glob
+import io
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from contextlib import asynccontextmanager
 
 import cv2
 import numpy as np
 import requests
+import soundfile as sf
 import torch
 import wave
 from fastapi import FastAPI, HTTPException
@@ -64,6 +68,7 @@ from musetalk.utils.utils import datagen, get_video_fps, load_all_model  # noqa:
 # ─── globals populated at startup ─────────────────────────────────────────
 state: dict = {}
 avatar_cache: dict[str, dict] = {}
+_gpu_lock = threading.Lock()
 
 
 def _pick_device() -> torch.device:
@@ -138,6 +143,7 @@ app.add_middleware(
 AVATAR_PRESETS = {
     "demo_a": "data/demo_five/talking_a_blink.mp4",
     "demo_b": "data/demo_five/talking_b_blink.mp4",
+    "agent": "data/demo_five/agent.jpg",
 }
 
 
@@ -231,8 +237,25 @@ def _write_input_media(tmp: str, data: bytes) -> tuple[list[str], float]:
     return img_list, fps
 
 
+def _gpu_exclusive(fn):
+    """Run one GPU job at a time; concurrent requests queue instead of sharing MPS."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not _gpu_lock.acquire(blocking=False):
+            print(f"[{fn.__name__}] waiting for previous job to finish…", flush=True)
+            _gpu_lock.acquire()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _gpu_lock.release()
+    return wrapper
+
+
+@_gpu_exclusive
 def prepare_avatar(video_bytes: bytes) -> dict:
     """Run the expensive one-time prep: frames, landmarks, VAE encode."""
+    print("[avatar] preparing…", flush=True)
+    _t0 = time.time()
     tmp = tempfile.mkdtemp(prefix="mt_avatar_")
     try:
         img_list, fps = _write_input_media(tmp, video_bytes)
@@ -268,6 +291,7 @@ def prepare_avatar(video_bytes: bytes) -> dict:
         if not input_latent_list:
             raise HTTPException(status_code=400, detail="No face detected in input")
 
+        print(f"[avatar] ready in {int((time.time() - _t0) * 1000)} ms", flush=True)
         return {
             "fps": fps,
             "coord_list_cycle": valid_coords + valid_coords[::-1],
@@ -280,6 +304,7 @@ def prepare_avatar(video_bytes: bytes) -> dict:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+@_gpu_exclusive
 def run_lipsync(avatar: dict, audio_bytes: bytes, batch_size: int = 16) -> bytes:
     """Given a prepared avatar and audio bytes, return final mp4 bytes."""
     prof = {}
@@ -303,12 +328,14 @@ def run_lipsync(avatar: dict, audio_bytes: bytes, batch_size: int = 16) -> bytes
 
         fps = avatar["fps"]
         _t = time.time()
+        print("[lipsync] audio features…", flush=True)
         whisper_features, librosa_len = audio_processor.get_audio_feature(wav)
         whisper_chunks = audio_processor.get_whisper_chunk(
             whisper_features, device, weight_dtype, whisper, librosa_len,
             fps=fps, audio_padding_length_left=2, audio_padding_length_right=2,
         )
         prof["audio_ms"] = int((time.time() - _t) * 1000)
+        print(f"[lipsync] audio features done in {prof['audio_ms']} ms", flush=True)
 
         coord_cycle = avatar["coord_list_cycle"]
         frame_cycle = avatar["frame_list_cycle"]
@@ -317,10 +344,14 @@ def run_lipsync(avatar: dict, audio_bytes: bytes, batch_size: int = 16) -> bytes
         crop_box_cycle = avatar["crop_box_list_cycle"]
 
         gen = datagen(whisper_chunks, latent_cycle, batch_size, 0, device)
+        n_frames = len(whisper_chunks)
+        n_batches = (n_frames + batch_size - 1) // batch_size
+        print(f"[lipsync] generating {n_frames} frames in {n_batches} batches on {device}", flush=True)
         res_frame_list = []
         _t = time.time()
         with torch.no_grad():
-            for whisper_batch, latent_batch in gen:
+            for b, (whisper_batch, latent_batch) in enumerate(gen, 1):
+                _tb = time.time()
                 audio_feat = pe(whisper_batch)
                 latent_batch = latent_batch.to(dtype=unet.model.dtype)
                 pred = unet.model(
@@ -329,8 +360,16 @@ def run_lipsync(avatar: dict, audio_bytes: bytes, batch_size: int = 16) -> bytes
                 recon = vae.decode_latents(pred)
                 for r in recon:
                     res_frame_list.append(r)
+                elapsed = time.time() - _t
+                eta = elapsed / b * (n_batches - b)
+                print(
+                    f"[lipsync] batch {b}/{n_batches} ({len(res_frame_list)}/{n_frames} frames) "
+                    f"{time.time() - _tb:.1f}s, elapsed {elapsed:.0f}s, eta {eta:.0f}s",
+                    flush=True,
+                )
         prof["unet_vae_ms"] = int((time.time() - _t) * 1000)
         prof["frames"] = len(res_frame_list)
+        print(f"[lipsync] blending + encoding {len(res_frame_list)} frames…", flush=True)
 
         # Build output video by piping BGR frames directly into ffmpeg's stdin.
         # Face-parse masks are precomputed per source frame during warmup, so
@@ -387,8 +426,15 @@ def run_lipsync(avatar: dict, audio_bytes: bytes, batch_size: int = 16) -> bytes
         prof["ffmpeg_mux_ms"] = int((time.time() - _t) * 1000)
         with open(final, "rb") as f:
             mp4 = f.read()
+        # Keep a copy on disk so a result is never lost if the client goes away.
+        os.makedirs("results/lipsync", exist_ok=True)
+        saved = os.path.abspath(
+            os.path.join("results/lipsync", time.strftime("%Y%m%d_%H%M%S") + ".mp4")
+        )
+        shutil.copyfile(final, saved)
         prof["total_ms"] = int((time.time() - _t0) * 1000)
         print(f"[profile] {prof}", flush=True)
+        print(f"[lipsync] saved {saved}", flush=True)
         return mp4
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -472,21 +518,39 @@ def speak(req: SpeakReq):
     wav_bytes = elevenlabs_tts(req.text, req.voice_id)
     tts_ms = int((time.time() - t_tts) * 1000)
 
+    return _lipsync_preset(req.avatar_key, wav_bytes, tts_ms, t_total)
+
+
+class SpeakAudioReq(BaseModel):
+    audio_b64: str
+    avatar_key: str = "demo_a"
+
+
+@app.post("/speak_audio")
+def speak_audio(req: SpeakAudioReq):
+    """Uploaded audio (wav/mp3) → MuseTalk lipsync. Skips ElevenLabs."""
+    t_total = time.time()
+    return _lipsync_preset(req.avatar_key, base64.b64decode(req.audio_b64), 0, t_total)
+
+
+def _lipsync_preset(avatar_key: str, audio_bytes: bytes, tts_ms: int, t_total: float) -> dict:
+    """Lipsync audio onto a preset avatar, preparing it on first use."""
     t_warm = time.time()
-    if req.avatar_key not in avatar_cache:
-        path = AVATAR_PRESETS.get(req.avatar_key)
+    if avatar_key not in avatar_cache:
+        path = AVATAR_PRESETS.get(avatar_key)
         if not path or not os.path.exists(path):
-            raise HTTPException(400, f"unknown avatar {req.avatar_key}")
-        avatar_cache[req.avatar_key] = prepare_avatar(open(path, "rb").read())
+            raise HTTPException(400, f"unknown avatar {avatar_key}")
+        avatar_cache[avatar_key] = prepare_avatar(open(path, "rb").read())
     warm_ms = int((time.time() - t_warm) * 1000)
 
     t_lip = time.time()
-    mp4 = run_lipsync(avatar_cache[req.avatar_key], wav_bytes)
+    mp4 = run_lipsync(avatar_cache[avatar_key], audio_bytes)
     lip_ms = int((time.time() - t_lip) * 1000)
 
     return {
         "video_b64": base64.b64encode(mp4).decode(),
-        "audio_bytes": len(wav_bytes),
+        "audio_bytes": len(audio_bytes),
+        "audio_s": round(sf.info(io.BytesIO(audio_bytes)).duration, 2),
         "video_bytes": len(mp4),
         "timing": {
             "tts_ms": tts_ms,

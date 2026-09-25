@@ -92,6 +92,7 @@
     <div>
       <div class="label">Avatar (rotates per turn)</div>
       <select id="avatar">
+        <option value="agent" selected>Agent (photo)</option>
         <option value="auto">Alternate A / B</option>
         <option value="demo_a">Talking A</option>
         <option value="demo_b">Talking B</option>
@@ -101,6 +102,11 @@
     <div>
       <div class="label">Text</div>
       <textarea id="text" placeholder="Type something for her to say…">Hi there! This is running on a Mac using MuseTalk, with voice from ElevenLabs. How fast did that feel to you?</textarea>
+    </div>
+
+    <div>
+      <div class="label">Or upload audio (skips ElevenLabs)</div>
+      <input type="file" id="audio" accept="audio/*">
     </div>
 
     <button id="go">Speak</button>
@@ -115,6 +121,15 @@ const btn = document.getElementById("go");
 const textEl = document.getElementById("text");
 const timingEl = document.getElementById("timing");
 const avatarEl = document.getElementById("avatar");
+const audioEl = document.getElementById("audio");
+
+// File → base64 string (without the "data:...;base64," prefix)
+const fileToB64 = (file) => new Promise((resolve, reject) => {
+  const r = new FileReader();
+  r.onload = () => resolve(r.result.split(",")[1]);
+  r.onerror = reject;
+  r.readAsDataURL(file);
+});
 
 // Default idle loop — an actual file from the 5-idle set
 v.src = "/media/idle_turn_left.mp4";
@@ -123,7 +138,8 @@ let turnCount = 0;
 
 btn.onclick = async () => {
   const text = textEl.value.trim();
-  if (!text) return;
+  const audioFile = audioEl.files[0];
+  if (!text && !audioFile) return;
   btn.disabled = true;
   timingEl.classList.remove("err");
   timingEl.textContent = "Generating…";
@@ -135,10 +151,13 @@ btn.onclick = async () => {
   }
 
   try {
-    const res = await fetch("/speak", {
+    const [url, body] = audioFile
+      ? ["/speak_audio", { audio_b64: await fileToB64(audioFile), avatar_key }]
+      : ["/speak", { text, avatar_key }];
+    const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text, avatar_key })
+      body: JSON.stringify(body)
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
     const j = await res.json();
@@ -156,19 +175,28 @@ btn.onclick = async () => {
     v.onended = () => {
       v.loop = true;
       v.muted = true;
+      v.controls = false;
       v.src = "/media/idle_turn_left.mp4";
     };
-    await v.play().catch(() => {});
+    let playMsg = "";
+    try {
+      await v.play();
+    } catch (err) {
+      // Autoplay blocked or decode failed — let the user start it manually.
+      v.controls = true;
+      timingEl.classList.add("err");
+      playMsg = `Video ready but couldn't auto-play (${err.name}). Press ▶ on the video.\n\n`;
+    }
 
     const t = j.timing;
-    const audioSec = (j.audio_bytes / 32000).toFixed(2);
+    const audioSec = j.audio_s.toFixed(2);
     const speed = (t.lipsync_ms / 1000 / audioSec).toFixed(2);
-    timingEl.textContent =
+    timingEl.textContent = playMsg +
       `avatar      : ${avatar_key}\n` +
       `audio       : ${audioSec}s (${(j.audio_bytes / 1024).toFixed(0)} KB)\n` +
       `video       : ${(j.video_bytes / 1024).toFixed(0)} KB\n` +
       `\n` +
-      `elevenlabs  : ${t.tts_ms} ms\n` +
+      `elevenlabs  : ${audioFile ? "skipped (uploaded audio)" : t.tts_ms + " ms"}\n` +
       `avatar prep : ${t.warmup_ms} ms ${t.warmup_ms < 5 ? "(cached)" : ""}\n` +
       `musetalk    : ${t.lipsync_ms} ms   (${speed}× realtime)\n` +
       `server tot. : ${t.total_ms} ms\n` +

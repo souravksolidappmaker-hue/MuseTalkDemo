@@ -1,5 +1,5 @@
 #!/bin/bash
-# Start the MuseTalk FastAPI server on the Mac.
+# Start the MuseTalk FastAPI server (macOS/MPS or Linux/CUDA).
 set -euo pipefail
 cd "$(dirname "$0")"
 source .venv/bin/activate

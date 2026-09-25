@@ -1,0 +1,15 @@
+.git
+.venv
+.venv-lp
+.env
+.env.*
+!.env.example
+**/__pycache__
+*.pyc
+.DS_Store
+.claude
+
+# Mounted at runtime / generated
+upstream/models
+upstream/results
+liveportrait

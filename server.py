@@ -1,4 +1,4 @@
-"""FastAPI server wrapping the Mac MuseTalk pipeline.
+"""FastAPI server wrapping the MuseTalk pipeline (Apple Silicon MPS or Linux CUDA).
 
 Matches the JSON contract of the existing Fly/GPU endpoint so the Next.js app
 can point at this server unchanged:
@@ -100,8 +100,10 @@ async def lifespan(_app: FastAPI):
         vae.vae = vae.vae.half()
         print("[musetalk] VAE → fp16", flush=True)
 
-    # UNet fp16 gave no measurable gain on MPS (see Phase C profile); leave off by default.
-    use_fp16_unet = os.environ.get("MUSETALK_FP16_UNET", "0") == "1"
+    # UNet fp16 gave no measurable gain on MPS (see Phase C profile); leave off by default
+    # there. On CUDA, tensor cores make it a clear win, so default it on.
+    default_fp16_unet = "1" if device.type == "cuda" else "0"
+    use_fp16_unet = os.environ.get("MUSETALK_FP16_UNET", default_fp16_unet) == "1"
     if use_fp16_unet and device.type in ("mps", "cuda"):
         unet.model = unet.model.half()
         pe = pe.half()

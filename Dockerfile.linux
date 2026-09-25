@@ -1,0 +1,37 @@
+# MuseTalk lipsync server — Linux + NVIDIA GPU.
+#
+# Build:  docker build -f Dockerfile.linux -t musetalk .
+# Run:    docker run --gpus all -p 8000:8000 --env-file .env \
+#           -v "$PWD/upstream/models:/app/upstream/models" musetalk
+#
+# Weights are not baked into the image; download them on the host with
+# ./download_weights_linux.sh and mount upstream/models as shown above.
+# Requires the NVIDIA Container Toolkit on the host. The torch cu121 wheels
+# bundle the CUDA runtime, so only the host driver is needed.
+
+FROM python:3.11-slim
+
+ARG CUDA_TAG=cu121
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ffmpeg libgl1 libglib2.0-0 curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements-linux.txt .
+RUN pip install --no-cache-dir \
+        "torch>=2.3.0" "torchvision>=0.18.0" "torchaudio>=2.3.0" \
+        --index-url "https://download.pytorch.org/whl/${CUDA_TAG}" \
+    && pip install --no-cache-dir -r requirements-linux.txt
+
+COPY . .
+# server.py mounts this (gitignored) dir at /media; it must exist at startup.
+RUN mkdir -p upstream/data/demo_five
+
+ENV GLOG_minloglevel=2 \
+    PYTHONUNBUFFERED=1 \
+    PORT=8000
+
+EXPOSE 8000
+CMD ["sh", "-c", "exec uvicorn server:app --host 0.0.0.0 --port ${PORT}"]

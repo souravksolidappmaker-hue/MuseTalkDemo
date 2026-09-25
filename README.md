@@ -53,6 +53,39 @@ pip install -r requirements-mac.txt
 
 **System requirements:** Apple Silicon (M1 / M2 / M3 / M4), macOS 14+, Python 3.11, `ffmpeg` on `PATH`.
 
+## Linux (NVIDIA GPU)
+
+The same code runs on Linux: device selection prefers CUDA, and on CUDA the server
+defaults both the VAE and UNet to fp16 (override with `MUSETALK_FP16_UNET=0`).
+Without an NVIDIA GPU it falls back to CPU, which works but is very slow.
+
+```bash
+# System packages (Ubuntu/Debian)
+sudo apt install python3.11 python3.11-venv ffmpeg libgl1 libglib2.0-0
+
+# venv + CUDA torch + deps. Arg is the PyTorch wheel tag: cu121 (default), cu118, cu124, cpu
+./setup_linux.sh cu121
+
+./download_weights_linux.sh
+./run_inference.sh configs/inference/smoke.yaml   # should print "Using device: cuda"
+./run_server.sh
+```
+
+**System requirements:** x86_64 or aarch64 Linux, Python 3.11, `ffmpeg`, NVIDIA driver
+recent enough for the chosen CUDA wheel (check with `nvidia-smi`).
+
+### Docker
+
+```bash
+./download_weights_linux.sh          # on the host (needs the venv from setup_linux.sh)
+docker build -f Dockerfile.linux -t musetalk .
+docker run --gpus all -p 8000:8000 --env-file .env \
+  -v "$PWD/upstream/models:/app/upstream/models" musetalk
+```
+
+Requires the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
+Weights are mounted rather than baked into the image.
+
 ## Run as a lipsync server
 
 ```bash
@@ -169,6 +202,10 @@ musetalk-mac/
 ├── run_inference.sh           # CLI inference for testing
 ├── download_weights_mac.sh    # fetches ~4GB of model weights
 ├── requirements-mac.txt       # Mac-friendly Python deps (no tensorflow, no openmmlab)
+├── setup_linux.sh             # Linux: venv + CUDA torch + deps
+├── download_weights_linux.sh  # Linux: same weights as the Mac script
+├── requirements-linux.txt     # Linux deps (torch installed separately per CUDA version)
+├── Dockerfile.linux           # Linux + NVIDIA GPU server image
 ├── scripts/
 │   ├── tts_elevenlabs.py
 │   ├── make_idles.py

@@ -1,12 +1,12 @@
 #!/bin/bash
-# Run MuseTalk inference on Apple Silicon (MPS).
+# Run MuseTalk inference (Apple Silicon MPS, or CUDA on Linux).
 # Usage: ./run_inference.sh [path/to/config.yaml]
 set -euo pipefail
 
 cd "$(dirname "$0")"
 source .venv/bin/activate
 
-# Let ops unsupported on MPS fall back to CPU instead of erroring.
+# Let ops unsupported on MPS fall back to CPU instead of erroring (no-op on Linux).
 export PYTORCH_ENABLE_MPS_FALLBACK=1
 # Silence mediapipe/absl noisy INFO logs.
 export GLOG_minloglevel=2
